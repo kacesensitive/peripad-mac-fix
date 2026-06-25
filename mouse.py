@@ -1,13 +1,17 @@
-import ctypes, time
+import ctypes, os, time
 from ctypes import (
     c_void_p, c_int32, c_uint32, c_uint8, c_long, c_char_p, c_int,
     POINTER, CFUNCTYPE, byref, addressof
 )
 from Quartz.CoreGraphics import (
     CGEventCreateMouseEvent, CGEventPost, CGEventCreate, CGEventGetLocation,
+    CGEventCreateScrollWheelEvent,
     CGDisplayBounds, CGGetActiveDisplayList,
     kCGEventMouseMoved, kCGHIDEventTap, kCGMouseButtonLeft,
+    kCGScrollEventUnitPixel,
 )
+
+DEBUG = bool(os.environ.get('DEBUG'))
 
 IOKit = ctypes.CDLL('/System/Library/Frameworks/IOKit.framework/IOKit')
 CF = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
@@ -40,13 +44,24 @@ ReportCallback = CFUNCTYPE(
 IOKit.IOHIDManagerRegisterInputReportCallback.argtypes = [c_void_p, ReportCallback, c_void_p]
 
 # tuning
-SENSITIVITY = 0.05
+SENSITIVITY = 0.05         # cursor speed (1 finger)
+SCROLL_SENSITIVITY = 0.10  # scroll speed (2 fingers)
+SCROLL_NATURAL = True      # True = content follows fingers (macOS default)
 LIFT_TIMEOUT = 0.10
+
+# report id 7 layout (8 bytes): [id, x_lo, x_hi, y_lo, y_hi, 00, 00, flag]
+# the device reports one contact per frame, time-multiplexed. the last byte
+# identifies the stream:
+#   0x08          -> a single finger is down            (move cursor)
+#   0x00 / 0x10   -> two fingers down, one per stream   (scroll)
+FLAG_OFFSET = 7
+TWO_FINGER_FLAGS = (0x00, 0x10)
 
 # state
 prev_x = None
 prev_y = None
 last_touch = 0.0
+scroll_prev = {}           # stream flag -> (x, y) of its previous frame
 
 def screen_bounds():
     err, ids, count = CGGetActiveDisplayList(16, None, None)
@@ -67,13 +82,43 @@ def move_by(dx, dy):
     ev = CGEventCreateMouseEvent(None, kCGEventMouseMoved, (nx, ny), kCGMouseButtonLeft)
     CGEventPost(kCGHIDEventTap, ev)
 
+def scroll_by(dy, dx):
+    vy = int(round(dy))
+    vx = int(round(dx))
+    if vy == 0 and vx == 0:
+        return
+    if SCROLL_NATURAL:
+        vy, vx = -vy, -vx
+    ev = CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitPixel, 2, vy, vx)
+    CGEventPost(kCGHIDEventTap, ev)
+
 def cb(context, result, sender, rtype, rid, report, length):
     global prev_x, prev_y, last_touch
     if rid != 7 or length < 5:
         return
+    now = time.time()
+
+    if DEBUG:
+        raw = ' '.join(f'{report[i]:02x}' for i in range(length))
+        print(f'len={length} {raw}')
+
     x = report[1] | (report[2] << 8)
     y = report[3] | (report[4] << 8)
-    now = time.time()
+    flag = report[FLAG_OFFSET] if length > FLAG_OFFSET else 0x08
+
+    # --- two fingers: scroll ---
+    if flag in TWO_FINGER_FLAGS:
+        prev = scroll_prev.get(flag)
+        if prev is not None and (now - last_touch) <= LIFT_TIMEOUT:
+            scroll_by((y - prev[1]) * SCROLL_SENSITIVITY,
+                      (x - prev[0]) * SCROLL_SENSITIVITY)
+        scroll_prev[flag] = (x, y)
+        prev_x = prev_y = None       # drop stale cursor delta when we return to 1 finger
+        last_touch = now
+        return
+
+    # --- one finger: move cursor ---
+    scroll_prev.clear()
     if prev_x is None or (now - last_touch) > LIFT_TIMEOUT:
         prev_x, prev_y = x, y
     else:
